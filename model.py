@@ -16,18 +16,10 @@ class SubmittedPricingStrategy(PricingStrategy):
         turn drives the pervasive activity_gate in scoring).
       * CLIENT-LIMIT GATE: client limit prices sit within ~0.48 pip of mid, so an
         offset wider than that fills nothing. We therefore quote in a tight band
-        and, when we WANT to stop trading a side, make it unfillable so it
-        cannot fill.
+        and, when we WANT to stop trading a side, push its offset well past the
+        gate ("refuse") so it cannot fill.
       * FILL PROBABILITY: full probability when our quote is at/inside the
         market-neutral bid/ask (offset <= half-spread); it decays when wider.
-      * QUOTE WIDTH IS SCORED AS A PER-TICK RATIO (measured on this exact model:
-        avg_relative_quote_width = 3.06): quote_quality uses
-        mean(quote_width_pips / market_spread_pip) and _score_width_ratio gives a
-        full 100 for ANY ratio <= 1.5 -- it is a CEILING, not a target. On the
-        ~1/3 of ticks whose spread is under ~0.08 pip, the fixed min_half_pips
-        floor produced ratios of 3-5 and dragged the average to 3.06 (raw quote
-        quality 71.9). The two WIDTH-RATIO GUARDS below fix exactly this and
-        change nothing else.
       * PnL is gated by drawdown- and inventory-quality, and everything is gated
         by latency and by an activity gate that needs market share >= ~10%. So
         the winning recipe is: capture enough two-way volume to clear the
@@ -37,18 +29,12 @@ class SubmittedPricingStrategy(PricingStrategy):
     Every tick (O(1), well under the 1.5ms latency budget):
       1. SPREAD  - half-width anchored to the market-neutral half-spread plus a
                    small edge, clamped into the fillable band.
-         1b. WIDTH-RATIO GUARD - on tiny-spread ticks where the floor would push
-                   the scored ratio past the 1.5 ceiling, quote proportional to
-                   the spread AND at block size so the quote cannot fill: clean
-                   ratio, zero thin-capture fills, zero new risk.
       2. INVENTORY SKEW - lean quotes against the position (long -> tighter ask /
                    wider bid) to attract offsetting flow.
       3. SIZE SHAPING - shrink the risk-adding side as inventory grows.
-      4. HARD REFUSE - beyond a hard inventory limit, collapse the risk-adding
-                   side to block size so it cannot fill at all (keeps a nominal
-                   size > 0 so the quote still counts as two-sided; refusing by
-                   SIZE instead of by a wide offset keeps the scored width ratio
-                   clean -- this is the second width-ratio guard).
+      4. HARD REFUSE - beyond a hard inventory limit, push the risk-adding side
+                   past the client-limit gate so it cannot fill at all (keeps a
+                   nominal size > 0 so the quote still counts as two-sided).
       5. FRIDAY / END-OF-WEEK FLATTEN - collapse the risk-adding side ahead of
                    the forced Friday-close / replay-end liquidation.
     """
@@ -65,7 +51,7 @@ class SubmittedPricingStrategy(PricingStrategy):
         self.ask_size_m = 5.0
 
         # ---------------------- TUNABLE PARAMETERS ----------------------
-        # (previous submission of this parameter set -> train 57.53 / test ~58.2-59.0;
+        # (baseline parameter set -> train 57.53 / official 58.99;
         #  final PnL ~ +$9.7M, avg inventory ~10.8m, max inventory ~61m)
 
         # Spread: offset = base_capture * market_half_spread + extra_pips ---------
@@ -74,27 +60,19 @@ class SubmittedPricingStrategy(PricingStrategy):
         self.min_half_pips = 0.05      # floor on quoted half-width
         self.max_half_pips = 0.50      # ceiling: staying inside the client-limit gate
 
-        # WIDTH-RATIO GUARD (the only new logic vs the 57.53 version) ------------
-        # If quoting min_half_pips on both sides would push the per-tick width
-        # ratio past the scored 1.5 ceiling, i.e. 2*min_half > 1.5*spread, switch
-        # that tick to proportional offsets at block size. Threshold:
-        # spread < 2*min_half/1.5 = 0.0667; use 0.08 to also absorb extra_pips.
-        self.tiny_spread_pips = 0.08   # below this, quote proportional + block size
-        self.tiny_capture = 0.70       # offset = tiny_capture * half_spread there
-                                       # (ratio = 0.70 <= 1.5 -> full width score)
-
         # Sizing (EUR millions) ---------------------------------------------------
-        # Kept modest so a single burst of client trades in one tick cannot stack
-        # a huge intra-step position (fills within a step all hit the same quote).
-        # Smaller per-quote size sharply cuts the intra-step burst that drives peak
-        # inventory and the resulting mark-to-market drawdown, while a slightly
-        # tighter offset keeps filled-volume share at the ~0.10 activity-gate knee.
-        self.base_size_m = 12.0
+        # VOLUME EXPERIMENT (the ONLY change vs the 58.99 baseline): 12 -> 20.
+        # Measured on the training data: market share (volume fill rate) is only
+        # 9.7% and fill_rate 14%, while market share is the largest scoring pool
+        # (raw 13/100 on weight 13). With NO PARTIAL FILLS, a 12m quote can only
+        # touch clients of size <= 12m: ~64% of client notional (42% in the peak
+        # hours 15-16, where avg client size is 11.5m). A 20m quote reaches ~88%.
+        # The drawdown-magnitude sub-score is already floored at 0 (dd $484k vs a
+        # $150k limit), so added volume cannot make that part worse; the watch
+        # items are max inventory (was 61m vs the 120m limit) and dd duration.
+        self.base_size_m = 20.0
         self.min_size_m = 1.0
-        self.max_size_m = 12.0
-        # block_size sits BELOW the smallest observed client trade (~0.54m) so a
-        # quote at this size cannot fill, while staying > 0 for two-sided uptime.
-        self.block_size_m = 0.30
+        self.max_size_m = 20.0
 
         # Inventory control -------------------------------------------------------
         self.inv_hard_m = 25.0         # size on the risk-adding side collapses by here
@@ -102,6 +80,7 @@ class SubmittedPricingStrategy(PricingStrategy):
         self.size_cut = 1.0            # risk-adding-side size reduction fraction
         self.skew_k = 0.04             # pips of price skew per 1m of inventory
         self.max_skew_pips = 0.45      # cap on price skew
+        self.refuse_offset_pips = 1.0  # past the ~0.48 pip client-limit gate -> no fills
 
         # Order-flow-imbalance (OFI) lean ----------------------------------------
         # The 600s signed markout is ~+0.19 pip, i.e. client flow is informed. We
@@ -141,14 +120,13 @@ class SubmittedPricingStrategy(PricingStrategy):
         mid = float(state.market_neutral_mid)
         mkt_spread_pips = float(state.market_neutral_spread_pip)
 
-        # Defensive guard: unusable tick -> quote narrow & small (never wide: a
-        # wide quote here would spike the per-tick width ratio) so it cannot fill.
+        # Defensive guard: unusable tick -> quote wide (no fills) & small.
         if mid <= 0.0 or mkt_spread_pips <= 0.0:
             return QuoteAction(
-                bid_offset_pips=0.10,
-                ask_offset_pips=0.10,
-                bid_size_m=self.block_size_m,
-                ask_size_m=self.block_size_m,
+                bid_offset_pips=self.refuse_offset_pips,
+                ask_offset_pips=self.refuse_offset_pips,
+                bid_size_m=self.min_size_m,
+                ask_size_m=self.min_size_m,
             )
 
         inventory = float(getattr(state, "inventory_eur_m", 0.0) or 0.0)
@@ -156,22 +134,6 @@ class SubmittedPricingStrategy(PricingStrategy):
         is_friday = day.startswith("fri")
         hour = self._parse_hour(getattr(state, "utc_time", None))
         in_flatten = is_friday and hour >= self.friday_flatten_hour
-
-        # --- 1b. WIDTH-RATIO GUARD (tiny-spread ticks) ------------------------
-        # Quoting the 0.05 floor here would score a width ratio of 3-5. Instead
-        # quote proportional (ratio 0.70 -> full width score) at block size so the
-        # quote cannot fill. These ticks previously captured only ~0.03-0.05 pip
-        # against 600-tick informed drift, so the lost fills are the worst ones.
-        if mkt_spread_pips < self.tiny_spread_pips:
-            off = self.tiny_capture * (mkt_spread_pips / 2.0)
-            if off < 1e-4:
-                off = 1e-4
-            return QuoteAction(
-                bid_offset_pips=off,
-                ask_offset_pips=off,
-                bid_size_m=self.block_size_m,
-                ask_size_m=self.block_size_m,
-            )
 
         # --- 1. BASE HALF-WIDTH (spread-anchored, clamped to fillable band) ---
         half = self.base_capture * (mkt_spread_pips / 2.0) + self.extra_pips
@@ -227,18 +189,15 @@ class SubmittedPricingStrategy(PricingStrategy):
                 ask_size = self.min_size_m
 
         # --- 5. HARD REFUSE beyond the inventory limit ------------------------
-        # Collapse the risk-adding side to block_size_m: below the smallest client
-        # trade so it cannot fill, but > 0 so the quote is still counted two-sided.
-        # (WIDTH-RATIO GUARD #2: refusing by SIZE, not by a wide offset, keeps the
-        # scored per-tick width ratio clean. Behaviourally identical to the old
-        # refuse_offset_pips=1.0 -- both produce zero fills on that side.)
+        # Push the risk-adding side past the client-limit gate so it cannot fill,
+        # fully halting further accumulation (size kept > 0 for two-sided uptime).
         if inventory >= self.max_inv_m:
-            bid_size = self.block_size_m
+            bid_offset = self.refuse_offset_pips
         elif inventory <= -self.max_inv_m:
-            ask_size = self.block_size_m
+            ask_offset = self.refuse_offset_pips
 
-        bid_size = self._clip(bid_size, self.block_size_m, self.max_size_m)
-        ask_size = self._clip(ask_size, self.block_size_m, self.max_size_m)
+        bid_size = self._clip(bid_size, self.min_size_m, self.max_size_m)
+        ask_size = self._clip(ask_size, self.min_size_m, self.max_size_m)
 
         return QuoteAction(
             bid_offset_pips=bid_offset,
