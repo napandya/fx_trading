@@ -100,9 +100,15 @@ class SubmittedPricingStrategy(PricingStrategy):
         # tighter bid (get long into strength), wider ask (don't sell the rise).
         # Width-neutral: total width is unchanged, only the CENTER shifts. Sizes,
         # inventory logic, skew, and OFI are untouched.
+        # v2 of the experiment: price-leaning was measured structurally negative
+        # (widening the faded side loses fills against the client-limit gate faster
+        # than tightening the favored side gains -- dose-response: cap 0.35 -> -3.1,
+        # cap 0.10 -> -1.9, cap 0 = baseline). The markout edge itself was REAL
+        # (+15% at tiny leans), so the same EWMA signal now enters through SIZE:
+        # offsets are NEVER changed; the faded side's size shrinks instead.
         self.mom_alpha = 0.02          # EWMA decay of per-tick mid change (~50-tick)
-        self.mom_k = 5.0               # pips of center shift per pip of EWMA signal
-        self.max_mom_shift_pips = 0.35 # cap on the momentum lean
+        self.mom_size_k = 8.0          # size-fade strength per pip of EWMA signal
+        self.max_mom_fade = 0.75       # max fraction of faded-side size removed
         self._mom = 0.0                # EWMA of signed mid change, in pips
         self._prev_mid = None
 
@@ -183,22 +189,27 @@ class SubmittedPricingStrategy(PricingStrategy):
         bid_offset = self._clip(bid_offset, self.min_half_pips, self.max_half_pips)
         ask_offset = self._clip(ask_offset, self.min_half_pips, self.max_half_pips)
 
-        # --- 2c. MOMENTUM LEAN: center the quote on a short-horizon forecast ---
+        # --- 2c. MOMENTUM SIGNAL UPDATE (offsets untouched) --------------------
         if self._prev_mid is not None:
             d_pips = (mid - self._prev_mid) / self.PIP
             self._mom += self.mom_alpha * (d_pips - self._mom)
         self._prev_mid = mid
-        mshift = self._clip(self.mom_k * self._mom,
-                            -self.max_mom_shift_pips, self.max_mom_shift_pips)
-        # rising market (mshift>0): tighten bid (buy into strength), widen ask
-        bid_offset -= mshift
-        ask_offset += mshift
-        bid_offset = self._clip(bid_offset, self.min_half_pips, self.max_half_pips)
-        ask_offset = self._clip(ask_offset, self.min_half_pips, self.max_half_pips)
 
         # --- 3. SIZE SHAPING: shrink the side that grows the position ---------
         bid_size = self.base_size_m
         ask_size = self.base_size_m
+
+        # 3a. MOMENTUM SIZE-FADE: shrink only the side whose fills would be
+        # adverse to the measured drift. Rising market (mom>0): selling into the
+        # rise is the negative-markout side -> fade the ASK; the bid stays full.
+        # Falling market: fade the BID. Offsets never move, so the favored side
+        # keeps full fill probability and no volume is lost to the limit gate.
+        fade = self._clip(self.mom_size_k * abs(self._mom), 0.0, self.max_mom_fade)
+        if self._mom > 0.0:
+            ask_size *= (1.0 - fade)
+        elif self._mom < 0.0:
+            bid_size *= (1.0 - fade)
+
         inv_ratio = min(1.0, abs(inventory) / self.inv_hard_m)
         if inventory > 0.0:            # long -> buying more is bad, selling is good
             bid_size *= (1.0 - self.size_cut * inv_ratio)
