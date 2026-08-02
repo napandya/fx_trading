@@ -40,9 +40,6 @@ class SubmittedPricingStrategy(PricingStrategy):
     """
 
     PIP = 0.0001  # EURUSD pip size
-    PEAK_HOURS = (15, 16)  # ~48% of client notional, ~3.4 requests/tick: intra-step
-                           # stacking risk lives here (flat 20m sent max inventory
-                           # from 61m to 124m, past the 120m scoring limit)
 
     def __init__(self) -> None:
         super().__init__()
@@ -64,22 +61,13 @@ class SubmittedPricingStrategy(PricingStrategy):
         self.max_half_pips = 0.50      # ceiling: staying inside the client-limit gate
 
         # Sizing (EUR millions) ---------------------------------------------------
-        # HOUR-CONDITIONAL VOLUME EXPERIMENT (the ONLY change vs 58.99 baseline):
-        # off-peak size 12 -> 20, PEAK hours 15-16 stay at 12.
-        # Measured evidence from the two prior runs on the training data:
-        #   * flat 12m: market share 9.7%, max inventory 61m  (train 57.53)
-        #   * flat 20m: market share 13.4% (+38% filled volume) BUT max inventory
-        #     124m -- past the 120m scoring limit -- because intra-step stacking
-        #     in hours 15-16 (3.4 requests/tick, all hitting the same quote)
-        #     doubles the one-tick inventory tail. Inventory + gated PnL lost far
-        #     more than market share gained (train 53.93).
-        # Off-peak, arrival rates are 0.2-1.5 requests/tick, so the same 20m size
-        # adds volume with almost no extra stacking tail. This keeps the measured
-        # volume gain where it was safe and removes it where it was poison.
-        self.base_size_m = 20.0        # off-peak hours
-        self.peak_size_m = 12.0        # hours 15-16: unchanged vs the 58.99 baseline
+        # Kept modest so a single burst of client trades in one tick cannot stack
+        # a huge intra-step position (fills within a step all hit the same quote).
+        # Measured: flat 20m lifted volume +38% but doubled the one-tick inventory
+        # tail (max 124m vs the 120m limit) and lost -3.6 net; 12m is the optimum.
+        self.base_size_m = 12.0
         self.min_size_m = 1.0
-        self.max_size_m = 20.0
+        self.max_size_m = 12.0
 
         # Inventory control -------------------------------------------------------
         self.inv_hard_m = 25.0         # size on the risk-adding side collapses by here
@@ -99,6 +87,24 @@ class SubmittedPricingStrategy(PricingStrategy):
         self.flow_decay = 0.997        # EWMA decay of signed client flow
         self.max_flow_skew_pips = 0.30 # cap on the OFI lean
         self._flow = 0.0
+
+        # Momentum reservation-shift (THE experiment in this version) ------------
+        # Everything else in this file is the proven 58.99 parameter set. This
+        # block re-centers the quote around a short-horizon FORECAST of the mid
+        # instead of the current mid. Rationale, measured on the training data:
+        # client flow is informed (+0.19 pip avg 600s markout), profit_factor is
+        # 1.02 (a coin flip -- the strategy has no view on the next move), and the
+        # scoring's markout (600 ticks) and regime-momentum (60 ticks) windows
+        # both reward being positioned WITH the drift. A decayed EWMA of signed
+        # mid changes leans the whole quote toward the trend: rising market ->
+        # tighter bid (get long into strength), wider ask (don't sell the rise).
+        # Width-neutral: total width is unchanged, only the CENTER shifts. Sizes,
+        # inventory logic, skew, and OFI are untouched.
+        self.mom_alpha = 0.02          # EWMA decay of per-tick mid change (~50-tick)
+        self.mom_k = 5.0               # pips of center shift per pip of EWMA signal
+        self.max_mom_shift_pips = 0.35 # cap on the momentum lean
+        self._mom = 0.0                # EWMA of signed mid change, in pips
+        self._prev_mid = None
 
         # End-of-week / end-of-replay flattening ---------------------------------
         self.friday_flatten_hour = 16  # UTC hour after which we push toward flat
@@ -177,10 +183,22 @@ class SubmittedPricingStrategy(PricingStrategy):
         bid_offset = self._clip(bid_offset, self.min_half_pips, self.max_half_pips)
         ask_offset = self._clip(ask_offset, self.min_half_pips, self.max_half_pips)
 
+        # --- 2c. MOMENTUM LEAN: center the quote on a short-horizon forecast ---
+        if self._prev_mid is not None:
+            d_pips = (mid - self._prev_mid) / self.PIP
+            self._mom += self.mom_alpha * (d_pips - self._mom)
+        self._prev_mid = mid
+        mshift = self._clip(self.mom_k * self._mom,
+                            -self.max_mom_shift_pips, self.max_mom_shift_pips)
+        # rising market (mshift>0): tighten bid (buy into strength), widen ask
+        bid_offset -= mshift
+        ask_offset += mshift
+        bid_offset = self._clip(bid_offset, self.min_half_pips, self.max_half_pips)
+        ask_offset = self._clip(ask_offset, self.min_half_pips, self.max_half_pips)
+
         # --- 3. SIZE SHAPING: shrink the side that grows the position ---------
-        size_cap = self.peak_size_m if hour in self.PEAK_HOURS else self.base_size_m
-        bid_size = size_cap
-        ask_size = size_cap
+        bid_size = self.base_size_m
+        ask_size = self.base_size_m
         inv_ratio = min(1.0, abs(inventory) / self.inv_hard_m)
         if inventory > 0.0:            # long -> buying more is bad, selling is good
             bid_size *= (1.0 - self.size_cut * inv_ratio)
@@ -204,8 +222,8 @@ class SubmittedPricingStrategy(PricingStrategy):
         elif inventory <= -self.max_inv_m:
             ask_offset = self.refuse_offset_pips
 
-        bid_size = self._clip(bid_size, self.min_size_m, size_cap)
-        ask_size = self._clip(ask_size, self.min_size_m, size_cap)
+        bid_size = self._clip(bid_size, self.min_size_m, self.max_size_m)
+        ask_size = self._clip(ask_size, self.min_size_m, self.max_size_m)
 
         return QuoteAction(
             bid_offset_pips=bid_offset,
