@@ -40,6 +40,9 @@ class SubmittedPricingStrategy(PricingStrategy):
     """
 
     PIP = 0.0001  # EURUSD pip size
+    PEAK_HOURS = (15, 16)  # ~48% of client notional, ~3.4 requests/tick: intra-step
+                           # stacking risk lives here (flat 20m sent max inventory
+                           # from 61m to 124m, past the 120m scoring limit)
 
     def __init__(self) -> None:
         super().__init__()
@@ -61,16 +64,20 @@ class SubmittedPricingStrategy(PricingStrategy):
         self.max_half_pips = 0.50      # ceiling: staying inside the client-limit gate
 
         # Sizing (EUR millions) ---------------------------------------------------
-        # VOLUME EXPERIMENT (the ONLY change vs the 58.99 baseline): 12 -> 20.
-        # Measured on the training data: market share (volume fill rate) is only
-        # 9.7% and fill_rate 14%, while market share is the largest scoring pool
-        # (raw 13/100 on weight 13). With NO PARTIAL FILLS, a 12m quote can only
-        # touch clients of size <= 12m: ~64% of client notional (42% in the peak
-        # hours 15-16, where avg client size is 11.5m). A 20m quote reaches ~88%.
-        # The drawdown-magnitude sub-score is already floored at 0 (dd $484k vs a
-        # $150k limit), so added volume cannot make that part worse; the watch
-        # items are max inventory (was 61m vs the 120m limit) and dd duration.
-        self.base_size_m = 20.0
+        # HOUR-CONDITIONAL VOLUME EXPERIMENT (the ONLY change vs 58.99 baseline):
+        # off-peak size 12 -> 20, PEAK hours 15-16 stay at 12.
+        # Measured evidence from the two prior runs on the training data:
+        #   * flat 12m: market share 9.7%, max inventory 61m  (train 57.53)
+        #   * flat 20m: market share 13.4% (+38% filled volume) BUT max inventory
+        #     124m -- past the 120m scoring limit -- because intra-step stacking
+        #     in hours 15-16 (3.4 requests/tick, all hitting the same quote)
+        #     doubles the one-tick inventory tail. Inventory + gated PnL lost far
+        #     more than market share gained (train 53.93).
+        # Off-peak, arrival rates are 0.2-1.5 requests/tick, so the same 20m size
+        # adds volume with almost no extra stacking tail. This keeps the measured
+        # volume gain where it was safe and removes it where it was poison.
+        self.base_size_m = 20.0        # off-peak hours
+        self.peak_size_m = 12.0        # hours 15-16: unchanged vs the 58.99 baseline
         self.min_size_m = 1.0
         self.max_size_m = 20.0
 
@@ -171,8 +178,9 @@ class SubmittedPricingStrategy(PricingStrategy):
         ask_offset = self._clip(ask_offset, self.min_half_pips, self.max_half_pips)
 
         # --- 3. SIZE SHAPING: shrink the side that grows the position ---------
-        bid_size = self.base_size_m
-        ask_size = self.base_size_m
+        size_cap = self.peak_size_m if hour in self.PEAK_HOURS else self.base_size_m
+        bid_size = size_cap
+        ask_size = size_cap
         inv_ratio = min(1.0, abs(inventory) / self.inv_hard_m)
         if inventory > 0.0:            # long -> buying more is bad, selling is good
             bid_size *= (1.0 - self.size_cut * inv_ratio)
@@ -196,8 +204,8 @@ class SubmittedPricingStrategy(PricingStrategy):
         elif inventory <= -self.max_inv_m:
             ask_offset = self.refuse_offset_pips
 
-        bid_size = self._clip(bid_size, self.min_size_m, self.max_size_m)
-        ask_size = self._clip(ask_size, self.min_size_m, self.max_size_m)
+        bid_size = self._clip(bid_size, self.min_size_m, size_cap)
+        ask_size = self._clip(ask_size, self.min_size_m, size_cap)
 
         return QuoteAction(
             bid_offset_pips=bid_offset,
